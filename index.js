@@ -189,12 +189,12 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/api/latest", async (req, res) => {
-  const deviceId = req.query.device_id || "COPD_01";
+  const patientId = req.query.patient_id || "P001";
 
   const { data, error } = await supabase
     .from("sensor_data")
     .select("*")
-    .eq("device_id", deviceId)
+    .eq("patient_id", patientId)
     .order("timestamp", { ascending: false })
     .limit(1)
     .single();
@@ -207,15 +207,14 @@ app.get("/api/latest", async (req, res) => {
 
   res.json(data);
 });
-
 app.get("/api/history", async (req, res) => {
-  const deviceId = req.query.device_id || "COPD_01";
+  const patientId = req.query.patient_id || "P001";
   const limit = Math.min(toNumber(req.query.limit, 100), 500);
 
   const { data, error } = await supabase
     .from("sensor_data")
     .select("*")
-    .eq("device_id", deviceId)
+    .eq("patient_id", patientId)
     .order("timestamp", { ascending: false })
     .limit(limit);
 
@@ -229,13 +228,13 @@ app.get("/api/history", async (req, res) => {
 });
 
 app.get("/api/alerts", async (req, res) => {
-  const deviceId = req.query.device_id || "COPD_01";
+  const patientId = req.query.patient_id || "P001";
   const limit = Math.min(toNumber(req.query.limit, 50), 200);
 
   const { data, error } = await supabase
     .from("alerts_log")
     .select("*")
-    .eq("device_id", deviceId)
+    .eq("patient_id", patientId)
     .order("timestamp", { ascending: false })
     .limit(limit);
 
