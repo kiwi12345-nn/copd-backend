@@ -3,12 +3,279 @@ import cors from "cors";
 import dotenv from "dotenv";
 import mqtt from "mqtt";
 import { createClient } from "@supabase/supabase-js";
-
+import crypto from "crypto";
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+
+// ============================================================
+// DEMO AUTH CHO APP FLUTTER
+// Bệnh nhân/người nhà chỉ xem được dữ liệu được cấp quyền
+// ============================================================
+
+const APP_JWT_SECRET =
+  process.env.APP_JWT_SECRET || "COPD_DEMO_SECRET_CHANGE_THIS_IN_RENDER";
+
+const demoUsers = [
+  {
+    user_id: "U_PATIENT_001",
+    email: "patient@example.com",
+    password: "123456",
+    full_name: "Bệnh nhân P001",
+    role: "patient",
+    patient_id: "P001",
+    allowed_patients: ["P001"],
+  },
+  {
+    user_id: "U_FAMILY_001",
+    email: "family@example.com",
+    password: "123456",
+    full_name: "Người nhà bệnh nhân P001",
+    role: "family",
+    patient_id: null,
+    allowed_patients: ["P001"],
+  },
+  {
+    user_id: "U_ADMIN_001",
+    email: "admin@example.com",
+    password: "123456",
+    full_name: "Bác sĩ / Quản trị viên",
+    role: "admin",
+    patient_id: null,
+    allowed_patients: ["P001", "P002", "P003"],
+  },
+];
+
+function base64url(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function signToken(payload) {
+  const body = base64url(JSON.stringify(payload));
+
+  const signature = crypto
+    .createHmac("sha256", APP_JWT_SECRET)
+    .update(body)
+    .digest("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+
+  return `${body}.${signature}`;
+}
+
+function verifyToken(token) {
+  try {
+    if (!token || !token.includes(".")) return null;
+
+    const [body, signature] = token.split(".");
+
+    const expectedSignature = crypto
+      .createHmac("sha256", APP_JWT_SECRET)
+      .update(body)
+      .digest("base64")
+      .replace(/=/g, "")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_");
+
+    if (signature !== expectedSignature) return null;
+
+    const json = Buffer.from(body, "base64").toString("utf8");
+    const payload = JSON.parse(json);
+
+    if (payload.exp && Date.now() > payload.exp) return null;
+
+    return payload;
+  } catch (err) {
+    return null;
+  }
+}
+
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.replace("Bearer ", "").trim();
+
+  const user = verifyToken(token);
+
+  if (!user) {
+    return res.status(401).json({
+      error: "UNAUTHORIZED",
+      message: "Bạn chưa đăng nhập hoặc token không hợp lệ",
+    });
+  }
+
+  req.user = user;
+  next();
+}
+
+function getDefaultPatientIdForUser(user) {
+  if (user.role === "patient") return user.patient_id;
+
+  if (Array.isArray(user.allowed_patients) && user.allowed_patients.length > 0) {
+    return user.allowed_patients[0];
+  }
+
+  return null;
+}
+
+function canAccessPatient(user, patientId) {
+  if (!user || !patientId) return false;
+
+  if (user.role === "admin" || user.role === "doctor") {
+    return true;
+  }
+
+  return Array.isArray(user.allowed_patients)
+    ? user.allowed_patients.includes(patientId)
+    : false;
+}
+
+// ============================================================
+// API AUTH
+// ============================================================
+
+app.post("/api/auth/login", (req, res) => {
+  const { email, password } = req.body || {};
+
+  const user = demoUsers.find(
+    (u) =>
+      u.email.toLowerCase() === String(email || "").toLowerCase() &&
+      u.password === String(password || "")
+  );
+
+  if (!user) {
+    return res.status(401).json({
+      error: "LOGIN_FAILED",
+      message: "Email hoặc mật khẩu không đúng",
+    });
+  }
+
+  const safeUser = {
+    user_id: user.user_id,
+    email: user.email,
+    full_name: user.full_name,
+    role: user.role,
+    patient_id: user.patient_id,
+    allowed_patients: user.allowed_patients,
+  };
+
+  const token = signToken({
+    ...safeUser,
+    exp: Date.now() + 1000 * 60 * 60 * 24 * 7,
+  });
+
+  res.json({
+    token,
+    user: safeUser,
+  });
+});
+
+app.get("/api/me", requireAuth, (req, res) => {
+  res.json({
+    user: req.user,
+  });
+});
+
+// ============================================================
+// API RIÊNG CHO APP FLUTTER
+// Không cho người dùng tự xem patient_id không thuộc quyền
+// ============================================================
+
+app.get("/api/my/latest", requireAuth, async (req, res) => {
+  const patientId = req.query.patient_id || getDefaultPatientIdForUser(req.user);
+
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Bạn không có quyền xem dữ liệu bệnh nhân này",
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("sensor_data")
+    .select("*")
+    .eq("patient_id", patientId)
+    .order("timestamp", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    return res.status(500).json({
+      error: error.message,
+    });
+  }
+
+  res.json(data);
+});
+
+app.get("/api/my/history", requireAuth, async (req, res) => {
+  const patientId = req.query.patient_id || getDefaultPatientIdForUser(req.user);
+  const limit = Math.min(Number(req.query.limit || 30), 100);
+
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Bạn không có quyền xem dữ liệu bệnh nhân này",
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("sensor_data")
+    .select("*")
+    .eq("patient_id", patientId)
+    .order("timestamp", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    return res.status(500).json({
+      error: error.message,
+    });
+  }
+
+  res.json(Array.isArray(data) ? data : []);
+});
+
+app.get("/api/my/alerts", requireAuth, async (req, res) => {
+  const patientId = req.query.patient_id || getDefaultPatientIdForUser(req.user);
+  const limit = Math.min(Number(req.query.limit || 30), 100);
+
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Bạn không có quyền xem dữ liệu bệnh nhân này",
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("alerts_log")
+    .select("*")
+    .eq("patient_id", patientId)
+    .order("timestamp", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    return res.status(500).json({
+      error: error.message,
+    });
+  }
+
+  res.json(Array.isArray(data) ? data : []);
+});
+
+
+
+
+
+
+
+
 
 const PORT = process.env.PORT || 3000;
 
