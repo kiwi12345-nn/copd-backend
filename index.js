@@ -16,7 +16,7 @@ const MQTT_URL = process.env.MQTT_URL || "mqtt://broker.emqx.io:1883";
 const MQTT_TOPIC = process.env.MQTT_TOPIC || "copd/patient1/data";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const APP_JWT_SECRET = process.env.APP_JWT_SECRET || "COPD_DEMO_SECRET_CHANGE_THIS_IN_RENDER";
+const APP_JWT_SECRET = process.env.APP_JWT_SECRET || "COPD_REAL_AUTH_SECRET_CHANGE_THIS_IN_RENDER";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("THIEU SUPABASE_URL HOAC SUPABASE_SERVICE_ROLE_KEY");
@@ -26,66 +26,10 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-// DEMO FALLBACK ACCOUNTS
-// Các tài khoản tạo thật sẽ lưu trong app_users Supabase.
+// REAL AUTH ONLY
+// Không còn tài khoản demo/fallback.
+// Người dùng phải tự đăng ký và dữ liệu được lưu trong Supabase app_users.
 // ============================================================
-const demoUsers = [
-  {
-    user_id: "U_PATIENT_001",
-    email: "patient@example.com",
-    password: "123456",
-    full_name: "Bệnh nhân P001",
-    phone: "",
-    role: "patient",
-    patient_id: "P001",
-    hospital_id: "H001",
-    allowed_patients: ["P001"],
-  },
-  {
-    user_id: "U_FAMILY_001",
-    email: "family@example.com",
-    password: "123456",
-    full_name: "Người nhà bệnh nhân P001",
-    phone: "",
-    role: "family",
-    patient_id: "P001",
-    hospital_id: "H001",
-    allowed_patients: ["P001"],
-  },
-  {
-    user_id: "U_DOCTOR_001",
-    email: "doctor@example.com",
-    password: "123456",
-    full_name: "BS. Hô hấp COPD",
-    phone: "",
-    role: "doctor",
-    patient_id: null,
-    hospital_id: "H001",
-    allowed_patients: ["P001", "P002", "P003"],
-  },
-  {
-    user_id: "U_HOSPITAL_001",
-    email: "hospital@example.com",
-    password: "123456",
-    full_name: "Bệnh viện Hô hấp COPD Demo",
-    phone: "",
-    role: "hospital",
-    patient_id: null,
-    hospital_id: "H001",
-    allowed_patients: ["P001", "P002", "P003"],
-  },
-  {
-    user_id: "U_ADMIN_001",
-    email: "admin@example.com",
-    password: "123456",
-    full_name: "Quản trị viên hệ thống",
-    phone: "",
-    role: "admin",
-    patient_id: null,
-    hospital_id: null,
-    allowed_patients: ["P001", "P002", "P003"],
-  },
-];
 
 // ============================================================
 // HELPERS
@@ -276,16 +220,10 @@ app.get("/api/hospitals", async (req, res) => {
     .order("hospital_name", { ascending: true });
 
   if (error) {
-    return res.json([
-      {
-        hospital_id: "H001",
-        hospital_name: "Bệnh viện Hô hấp COPD Demo",
-        address: "Tư vấn online",
-        phone: "0900000001",
-        email: "hospital@example.com",
-        active: true,
-      },
-    ]);
+    return res.status(500).json({
+      error: error.message,
+      message: "Không tải được danh sách bệnh viện đã đăng ký"
+    });
   }
 
   res.json(Array.isArray(data) ? data : []);
@@ -375,7 +313,28 @@ app.post("/api/auth/register", async (req, res) => {
   }
 
   if (role === "family") {
-    patientId = patientId || "P001";
+    if (!patientId) {
+      return res.status(400).json({
+        error: "MISSING_PATIENT_ID",
+        message: "Người nhà cần nhập mã bệnh nhân cần theo dõi"
+      });
+    }
+
+    const { data: linkedPatient } = await supabase
+      .from("hospital_patient_links")
+      .select("patient_id")
+      .eq("hospital_id", hospitalId)
+      .eq("patient_id", patientId)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (!linkedPatient) {
+      return res.status(404).json({
+        error: "PATIENT_NOT_FOUND_IN_HOSPITAL",
+        message: "Không tìm thấy mã bệnh nhân này trong bệnh viện đã chọn"
+      });
+    }
+
     allowedPatients = [patientId];
   }
 
@@ -450,27 +409,10 @@ app.post("/api/auth/login", async (req, res) => {
     return res.json({ token: tokenForUser(safeUser), user: safeUser });
   }
 
-  const demo = demoUsers.find(
-    (u) => u.email.toLowerCase() === email && u.password === password
-  );
-
-  if (!demo) {
-    return res.status(401).json({ error: "LOGIN_FAILED", message: "Email hoặc mật khẩu không đúng" });
-  }
-
-  const safeUser = {
-    user_id: demo.user_id,
-    email: demo.email,
-    full_name: demo.full_name,
-    phone: demo.phone || "",
-    role: demo.role,
-    patient_id: demo.patient_id,
-    hospital_id: demo.hospital_id,
-    allowed_patients: await getAllowedPatientsForUser(demo),
-  };
-
-  await logActivity(safeUser, "LOGIN_DEMO", { source: "demoUsers" }, safeUser.patient_id);
-  res.json({ token: tokenForUser(safeUser), user: safeUser });
+  return res.status(401).json({
+    error: "LOGIN_FAILED",
+    message: "Email hoặc mật khẩu không đúng hoặc tài khoản chưa được đăng ký"
+  });
 });
 
 app.get("/api/me", requireAuth, (req, res) => res.json({ user: req.user }));
@@ -566,7 +508,7 @@ app.get("/api/doctors", requireAuth, async (req, res) => {
         hospital_id: req.user.hospital_id || "H001",
         full_name: "BS. Hô hấp COPD",
         specialty: "Hô hấp - COPD",
-        hospital: "Bệnh viện Hô hấp COPD Demo",
+        hospital: "Bệnh viện đã đăng ký",
         experience_years: 8,
         price: 150000,
         location: "Tư vấn online",
@@ -917,7 +859,7 @@ mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 // PUBLIC DASHBOARD LEGACY API
 // ============================================================
 app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V6", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V6", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V7_REAL_AUTH", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = req.query.patient_id || "P001";
