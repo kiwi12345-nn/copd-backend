@@ -47,6 +47,15 @@ const demoUsers = [
     patient_id: null,
     allowed_patients: ["P001", "P002", "P003"],
   },
+  {
+    user_id: "U_DOCTOR_001",
+    email: "doctor@example.com",
+    password: "123456",
+    full_name: "BS. Hô hấp COPD",
+    role: "doctor",
+    patient_id: null,
+    allowed_patients: ["P001", "P002", "P003"],
+  },
 ];
 
 function base64url(input) {
@@ -181,6 +190,240 @@ app.get("/api/me", requireAuth, (req, res) => {
   res.json({
     user: req.user,
   });
+});
+
+
+// ============================================================
+// API ĐẶT LỊCH TÁI KHÁM / BÁC SĨ NHẬN LỊCH
+// Dùng thật với Supabase table: doctors, doctor_appointments
+// ============================================================
+
+function canManageAppointments(user) {
+  return user && (user.role === "admin" || user.role === "doctor");
+}
+
+app.get("/api/doctors", requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from("doctors")
+    .select("*")
+    .order("full_name", { ascending: true });
+
+  if (error) {
+    // Fallback để app vẫn có bác sĩ nếu chưa tạo bảng doctors
+    return res.json([
+      {
+        doctor_id: "D001",
+        full_name: "BS. Hô hấp COPD",
+        specialty: "Hô hấp - COPD",
+        hospital: "Phòng khám Hô hấp từ xa",
+        experience_years: 8,
+        price: 150000,
+        location: "Tư vấn online",
+        rating: 4.8
+      }
+    ]);
+  }
+
+  res.json(Array.isArray(data) ? data : []);
+});
+
+app.post("/api/my/appointments", requireAuth, async (req, res) => {
+  const body = req.body || {};
+  const doctorId = String(body.doctor_id || "D001");
+  const appointmentDate = String(body.appointment_date || "").trim();
+  const appointmentTime = String(body.appointment_time || "").trim();
+  const reason = String(body.reason || "Tái khám COPD định kỳ").trim();
+  const patientId = String(body.patient_id || getDefaultPatientIdForUser(req.user) || "P001");
+
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Bạn không có quyền đặt lịch cho bệnh nhân này"
+    });
+  }
+
+  if (!appointmentDate || !appointmentTime) {
+    return res.status(400).json({
+      error: "MISSING_FIELDS",
+      message: "Thiếu ngày hoặc khung giờ khám"
+    });
+  }
+
+  const { data: lastRows, error: queueError } = await supabase
+    .from("doctor_appointments")
+    .select("queue_number")
+    .eq("doctor_id", doctorId)
+    .eq("appointment_date", appointmentDate)
+    .eq("appointment_time", appointmentTime)
+    .order("queue_number", { ascending: false })
+    .limit(1);
+
+  if (queueError) {
+    return res.status(500).json({ error: queueError.message });
+  }
+
+  const lastQueue = Array.isArray(lastRows) && lastRows.length > 0
+    ? Number(lastRows[0].queue_number || 0)
+    : 0;
+
+  const row = {
+    doctor_id: doctorId,
+    patient_id: patientId,
+    patient_name: body.patient_name || req.user.full_name || patientId,
+    requester_user_id: req.user.user_id,
+    requester_name: req.user.full_name,
+    requester_role: req.user.role,
+    appointment_date: appointmentDate,
+    appointment_time: appointmentTime,
+    queue_number: lastQueue + 1,
+    reason,
+    status: "pending",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  const { data, error } = await supabase
+    .from("doctor_appointments")
+    .insert(row)
+    .select("*")
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.json({
+    success: true,
+    appointment: data,
+    message: `Đã đặt lịch. Số thứ tự của bạn trong khung ${appointmentTime} là ${data.queue_number}`
+  });
+});
+
+
+app.post("/api/my/sos", requireAuth, async (req, res) => {
+  const patientId = String(req.body?.patient_id || getDefaultPatientIdForUser(req.user) || "P001");
+  const message = String(req.body?.message || "SOS khẩn cấp từ ứng dụng COPD Care");
+
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Bạn không có quyền gửi SOS cho bệnh nhân này"
+    });
+  }
+
+  await supabase.from("devices").upsert(
+    {
+      device_id: "MOBILE_APP",
+      patient_id: patientId,
+      device_name: "COPD Care Mobile App",
+      online: true,
+      last_seen_at: new Date().toISOString()
+    },
+    { onConflict: "device_id" }
+  );
+
+  const { data, error } = await supabase
+    .from("alerts_log")
+    .insert({
+      patient_id: patientId,
+      device_id: "MOBILE_APP",
+      alert_level: 3,
+      alert_type: "SOS_APP",
+      alert_value: 1,
+      threshold_value: 1,
+      message,
+      timestamp: new Date().toISOString()
+    })
+    .select("*")
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json({ success: true, alert: data });
+});
+
+app.get("/api/my/appointments", requireAuth, async (req, res) => {
+  const patientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "P001");
+  const limit = Math.min(Number(req.query.limit || 50), 100);
+
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Bạn không có quyền xem lịch của bệnh nhân này"
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("doctor_appointments")
+    .select("*")
+    .eq("patient_id", patientId)
+    .order("appointment_date", { ascending: true })
+    .order("appointment_time", { ascending: true })
+    .order("queue_number", { ascending: true })
+    .limit(limit);
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json(Array.isArray(data) ? data : []);
+});
+
+app.get("/api/doctor/appointments", requireAuth, async (req, res) => {
+  if (!canManageAppointments(req.user)) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Chỉ bác sĩ/admin được xem danh sách lịch hẹn"
+    });
+  }
+
+  const status = String(req.query.status || "").trim();
+  let query = supabase
+    .from("doctor_appointments")
+    .select("*")
+    .order("appointment_date", { ascending: true })
+    .order("appointment_time", { ascending: true })
+    .order("queue_number", { ascending: true });
+
+  if (status) query = query.eq("status", status);
+
+  const { data, error } = await query.limit(200);
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json(Array.isArray(data) ? data : []);
+});
+
+app.patch("/api/doctor/appointments/:id/status", requireAuth, async (req, res) => {
+  if (!canManageAppointments(req.user)) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Chỉ bác sĩ/admin được cập nhật lịch hẹn"
+    });
+  }
+
+  const id = req.params.id;
+  const status = String(req.body?.status || "").trim();
+  const allowed = ["pending", "confirmed", "done", "cancelled"];
+
+  if (!allowed.includes(status)) {
+    return res.status(400).json({
+      error: "INVALID_STATUS",
+      message: "Trạng thái không hợp lệ"
+    });
+  }
+
+  const { data, error } = await supabase
+    .from("doctor_appointments")
+    .update({
+      status,
+      updated_at: new Date().toISOString()
+    })
+    .eq("appointment_id", id)
+    .select("*")
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json({ success: true, appointment: data });
 });
 
 // ============================================================
