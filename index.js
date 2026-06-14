@@ -193,6 +193,37 @@ app.get("/api/me", requireAuth, (req, res) => {
 });
 
 
+
+app.get("/api/my/patients", requireAuth, async (req, res) => {
+  const allowed = Array.isArray(req.user.allowed_patients) && req.user.allowed_patients.length > 0
+    ? req.user.allowed_patients
+    : (req.user.patient_id ? [req.user.patient_id] : ["P001"]);
+
+  let rows = [];
+  const { data, error } = await supabase
+    .from("patients")
+    .select("*")
+    .in("patient_id", allowed)
+    .order("patient_id", { ascending: true });
+
+  if (!error && Array.isArray(data)) rows = data;
+
+  const merged = allowed.map((patientId) => {
+    const found = rows.find((r) => String(r.patient_id) === String(patientId));
+    return found || {
+      patient_id: patientId,
+      full_name: patientId === "P001" ? "Bệnh nhân P001" : `Bệnh nhân ${patientId}`,
+      gender: "---",
+      age: null,
+      diagnosis: "COPD cần theo dõi hô hấp",
+      phone: "---",
+      address: "---"
+    };
+  });
+
+  res.json(merged);
+});
+
 // ============================================================
 // API ĐẶT LỊCH TÁI KHÁM / BÁC SĨ NHẬN LỊCH
 // Dùng thật với Supabase table: doctors, doctor_appointments
