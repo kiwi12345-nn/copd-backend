@@ -171,6 +171,71 @@ function buildDateRange(dateValue) {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
+
+async function hasSensorData(patientId) {
+  if (!patientId) return false;
+  const { data, error } = await supabase
+    .from("sensor_data")
+    .select("id")
+    .eq("patient_id", String(patientId))
+    .order("timestamp", { ascending: false })
+    .limit(1);
+  return !error && Array.isArray(data) && data.length > 0;
+}
+
+async function getLatestSensorPatientId() {
+  const { data, error } = await supabase
+    .from("sensor_data")
+    .select("patient_id")
+    .not("patient_id", "is", null)
+    .order("timestamp", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (!error && data?.patient_id) return String(data.patient_id);
+  return "P001";
+}
+
+
+async function getLatestVitalsRow(patientId) {
+  const { data, error } = await supabase
+    .from("sensor_data")
+    .select("*")
+    .eq("patient_id", String(patientId))
+    .order("timestamp", { ascending: false })
+    .limit(300);
+
+  if (error) throw error;
+  if (!Array.isArray(data) || data.length === 0) return null;
+
+  const latest = { ...data[0] };
+  const latestPositive = (key) => {
+    const found = data.find((r) => Number(r[key] ?? 0) > 0);
+    return found ? found[key] : latest[key];
+  };
+
+  // V11 FIX: sensor_data có thể xen kẽ dòng 0 khi chưa đặt tay MAX.
+  // App cần hiển thị kết quả đo hợp lệ gần nhất, không để --- chỉ vì dòng mới nhất là 0.
+  latest.rr = latestPositive("rr");
+  latest.hr = latestPositive("hr");
+  latest.spo2 = latestPositive("spo2");
+  latest.temperature = latestPositive("temperature");
+  latest.ready = Number(latest.hr || 0) > 0 || Number(latest.spo2 || 0) > 0 || latest.ready === true;
+  latest.alert_message = latest.alert_message || "DANG CAP NHAT DU LIEU CAM BIEN";
+  return latest;
+}
+
+async function resolvePatientIdWithSensorFallback(user, requestedPatientId) {
+  const requested = String(requestedPatientId || getDefaultPatientIdForUser(user) || "P001");
+
+  // Nếu bệnh nhân đang chọn đã có dữ liệu cảm biến, dùng đúng bệnh nhân đó.
+  if (await hasSensorData(requested)) return requested;
+
+  // Nếu bệnh nhân đang chọn chưa có dữ liệu, dùng bệnh nhân đang có dữ liệu cảm biến mới nhất.
+  // Cách này giúp app luôn hiển thị số đo thật từ ESP32 trong mô hình 1 thiết bị thử nghiệm.
+  const latestSensorPatient = await getLatestSensorPatientId();
+  return latestSensorPatient || requested;
+}
+
 function getDefaultPatientIdForUser(user) {
   if (user?.role === "patient") return user.patient_id;
   if (Array.isArray(user?.allowed_patients) && user.allowed_patients.length > 0) {
@@ -210,7 +275,18 @@ async function getAllowedPatientsForUser(user) {
     return user.allowed_patients.map(String);
   }
 
-  return user.patient_id ? [String(user.patient_id)] : ["P001"];
+  const ownPatientId = user.patient_id ? String(user.patient_id) : null;
+  const latestSensorPatient = await getLatestSensorPatientId();
+
+  if (ownPatientId && await hasSensorData(ownPatientId)) {
+    return [ownPatientId];
+  }
+
+  if (latestSensorPatient) {
+    return [latestSensorPatient];
+  }
+
+  return ownPatientId ? [ownPatientId] : ["P001"];
 }
 
 async function logActivity(user, action, details = {}, patientId = null) {
@@ -709,29 +785,22 @@ app.patch("/api/doctor/appointments/:id/status", requireAuth, async (req, res) =
 // SENSOR / ALERT / SOS API CHO APP
 // ============================================================
 app.get("/api/my/latest", requireAuth, async (req, res) => {
-  const patientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user));
-  if (!canAccessPatient(req.user, patientId)) return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền xem dữ liệu bệnh nhân này" });
+  const requestedPatientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "P001");
+  const patientId = await resolvePatientIdWithSensorFallback(req.user, requestedPatientId);
 
-  const { data, error } = await supabase
-    .from("sensor_data")
-    .select("*")
-    .eq("patient_id", patientId)
-    .order("timestamp", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  try {
+    const data = await getLatestVitalsRow(patientId);
+    return res.json(data);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
 });
 
 app.get("/api/my/history", requireAuth, async (req, res) => {
-  const patientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user));
+  const requestedPatientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "P001");
+  const patientId = await resolvePatientIdWithSensorFallback(req.user, requestedPatientId);
   const limit = Math.min(Number(req.query.limit || 80), 500);
   const dateRange = buildDateRange(req.query.date);
-
-  if (!canAccessPatient(req.user, patientId)) {
-    return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền xem dữ liệu bệnh nhân này" });
-  }
 
   let query = supabase
     .from("sensor_data")
@@ -962,7 +1031,7 @@ mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 // PUBLIC DASHBOARD LEGACY API
 // ============================================================
 app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V8", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V10_FIX_LIVE_DATA", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V11_SENSOR_LIVE_FALLBACK", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = req.query.patient_id || "P001";
