@@ -78,19 +78,39 @@ function verifyToken(token) {
   }
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.replace("Bearer ", "").trim();
-  const user = verifyToken(token);
+  const tokenUser = verifyToken(token);
 
-  if (!user) {
+  if (!tokenUser) {
     return res.status(401).json({
       error: "UNAUTHORIZED",
       message: "Bạn chưa đăng nhập hoặc token không hợp lệ",
     });
   }
 
-  req.user = user;
+  // V10 FIX: Token cũ có thể còn patient_id cũ trong trình duyệt.
+  // Mỗi request sẽ đọc lại user mới nhất từ Supabase theo user_id/email,
+  // nhờ vậy khi sửa patient_id trong database thì app lấy đúng dữ liệu cảm biến.
+  try {
+    let query = supabase.from("app_users").select("*").eq("active", true);
+    if (tokenUser.user_id) {
+      query = query.eq("user_id", tokenUser.user_id);
+    } else {
+      query = query.eq("email", normalizeEmail(tokenUser.email));
+    }
+
+    const { data: dbUser, error } = await query.maybeSingle();
+    if (!error && dbUser) {
+      req.user = await buildSafeUser(dbUser);
+      return next();
+    }
+  } catch (e) {
+    console.error("LOI REFRESH USER:", e.message);
+  }
+
+  req.user = tokenUser;
   next();
 }
 
@@ -942,7 +962,7 @@ mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 // PUBLIC DASHBOARD LEGACY API
 // ============================================================
 app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V8", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V9_CLEAN_AUTO_PATIENT_ID", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V10_FIX_LIVE_DATA", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = req.query.patient_id || "P001";
