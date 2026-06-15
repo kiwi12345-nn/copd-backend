@@ -172,6 +172,49 @@ function buildDateRange(dateValue) {
 }
 
 
+async function getPatientCreatedAt(patientId) {
+  const pid = String(patientId || "").trim();
+  if (!pid) return null;
+
+  // V12: dữ liệu đo của tài khoản chỉ tính từ lúc tài khoản bệnh nhân đó được tạo.
+  const { data: userRows } = await supabase
+    .from("app_users")
+    .select("created_at")
+    .eq("role", "patient")
+    .eq("patient_id", pid)
+    .eq("active", true)
+    .order("created_at", { ascending: true })
+    .limit(1);
+
+  if (Array.isArray(userRows) && userRows.length > 0 && userRows[0].created_at) {
+    return userRows[0].created_at;
+  }
+
+  const { data: patient } = await supabase
+    .from("patients")
+    .select("created_at")
+    .eq("patient_id", pid)
+    .maybeSingle();
+
+  return patient?.created_at || null;
+}
+
+async function querySensorRowsForAccount(patientId, limit = 300, dateRange = null) {
+  const createdAt = await getPatientCreatedAt(patientId);
+  let query = supabase
+    .from("sensor_data")
+    .select("*")
+    .eq("patient_id", String(patientId))
+    .order("timestamp", { ascending: false })
+    .limit(limit);
+
+  if (createdAt) query = query.gte("timestamp", createdAt);
+  if (dateRange) query = query.gte("timestamp", dateRange.start).lt("timestamp", dateRange.end);
+
+  return query;
+}
+
+
 async function hasSensorData(patientId) {
   if (!patientId) return false;
   const { data, error } = await supabase
@@ -197,12 +240,7 @@ async function getLatestSensorPatientId() {
 
 
 async function getLatestVitalsRow(patientId) {
-  const { data, error } = await supabase
-    .from("sensor_data")
-    .select("*")
-    .eq("patient_id", String(patientId))
-    .order("timestamp", { ascending: false })
-    .limit(300);
+  const { data, error } = await querySensorRowsForAccount(patientId, 300, null);
 
   if (error) throw error;
   if (!Array.isArray(data) || data.length === 0) return null;
@@ -213,8 +251,8 @@ async function getLatestVitalsRow(patientId) {
     return found ? found[key] : latest[key];
   };
 
-  // V11 FIX: sensor_data có thể xen kẽ dòng 0 khi chưa đặt tay MAX.
-  // App cần hiển thị kết quả đo hợp lệ gần nhất, không để --- chỉ vì dòng mới nhất là 0.
+  // V12: vẫn lấy giá trị hợp lệ gần nhất nhưng chỉ trong dữ liệu của đúng tài khoản,
+  // và chỉ từ thời điểm tài khoản bệnh nhân đó được tạo.
   latest.rr = latestPositive("rr");
   latest.hr = latestPositive("hr");
   latest.spo2 = latestPositive("spo2");
@@ -442,6 +480,21 @@ app.post("/api/auth/register", async (req, res) => {
         created_at: new Date().toISOString(),
       },
       { onConflict: "hospital_id,patient_id" }
+    );
+
+
+    // V12: mô hình demo dùng 1 thiết bị ESP32-S3 COPD_01.
+    // Khi tạo tài khoản bệnh nhân, gán thiết bị này cho bệnh nhân vừa tạo.
+    // Dữ liệu cảm biến gửi sau thời điểm tạo tài khoản sẽ thuộc đúng patient_id đó.
+    await supabase.from("devices").upsert(
+      {
+        device_id: "COPD_01",
+        patient_id: patientId,
+        device_name: "ESP32-S3 COPD Monitor",
+        online: true,
+        last_seen_at: new Date().toISOString(),
+      },
+      { onConflict: "device_id" }
     );
   }
 
@@ -785,8 +838,10 @@ app.patch("/api/doctor/appointments/:id/status", requireAuth, async (req, res) =
 // SENSOR / ALERT / SOS API CHO APP
 // ============================================================
 app.get("/api/my/latest", requireAuth, async (req, res) => {
-  const requestedPatientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "P001");
-  const patientId = await resolvePatientIdWithSensorFallback(req.user, requestedPatientId);
+  const patientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "");
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền xem dữ liệu bệnh nhân này" });
+  }
 
   try {
     const data = await getLatestVitalsRow(patientId);
@@ -797,29 +852,22 @@ app.get("/api/my/latest", requireAuth, async (req, res) => {
 });
 
 app.get("/api/my/history", requireAuth, async (req, res) => {
-  const requestedPatientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "P001");
-  const patientId = await resolvePatientIdWithSensorFallback(req.user, requestedPatientId);
+  const patientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "");
   const limit = Math.min(Number(req.query.limit || 80), 500);
   const dateRange = buildDateRange(req.query.date);
 
-  let query = supabase
-    .from("sensor_data")
-    .select("*")
-    .eq("patient_id", patientId)
-    .order("timestamp", { ascending: false })
-    .limit(limit);
-
-  if (dateRange) {
-    query = query.gte("timestamp", dateRange.start).lt("timestamp", dateRange.end);
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền xem lịch sử đo bệnh nhân này" });
   }
 
-  const { data, error } = await query;
+  const { data, error } = await querySensorRowsForAccount(patientId, limit, dateRange);
   if (error) return res.status(500).json({ error: error.message });
 
   if (String(req.query.track || "") === "1") {
     await logActivity(req.user, "VIEW_MEASUREMENT_HISTORY", {
       patient_id: patientId,
       date: req.query.date || "latest",
+      from_created_at: await getPatientCreatedAt(patientId),
       count: Array.isArray(data) ? data.length : 0,
     }, patientId);
   }
@@ -912,23 +960,31 @@ async function patientExists(patientId) {
 }
 
 async function resolveSensorPatientId(payload) {
+  const deviceId = payload.device || payload.device_id || "COPD_01";
+
+  // V12: ưu tiên gán dữ liệu theo thiết bị đang được liên kết với tài khoản bệnh nhân.
+  // Nhờ vậy nếu ESP32 vẫn gửi patient_id cũ như P001, backend vẫn lưu vào đúng tài khoản đã tạo.
+  const { data: device } = await supabase
+    .from("devices")
+    .select("patient_id")
+    .eq("device_id", deviceId)
+    .maybeSingle();
+
+  if (device?.patient_id && await patientExists(String(device.patient_id))) {
+    return String(device.patient_id);
+  }
+
   const incoming = payload.patient_id ? String(payload.patient_id).trim() : "";
   if (incoming && await patientExists(incoming)) return incoming;
 
-  const deviceId = payload.device || payload.device_id || "COPD_01";
-  const { data: device } = await supabase.from("devices").select("patient_id").eq("device_id", deviceId).maybeSingle();
-  if (device?.patient_id && await patientExists(String(device.patient_id))) return String(device.patient_id);
-
-  // Nếu ESP32 vẫn gửi P001 sau khi reset, backend tự gán vào bệnh nhân đầu tiên để tránh mất lịch sử đo.
-  // Khi có nhiều bệnh nhân, nên sửa firmware ESP32 gửi đúng patient_id được cấp trong app.
   const { data: firstPatient } = await supabase
     .from("patients")
     .select("patient_id")
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-  if (firstPatient?.patient_id) return String(firstPatient.patient_id);
 
+  if (firstPatient?.patient_id) return String(firstPatient.patient_id);
   return incoming || "P0001";
 }
 
@@ -1030,8 +1086,8 @@ mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 // ============================================================
 // PUBLIC DASHBOARD LEGACY API
 // ============================================================
-app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V8", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V11_SENSOR_LIVE_FALLBACK", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V12", mqtt_topic: MQTT_TOPIC }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V12_ACCOUNT_HISTORY_FROM_CREATED_AT", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = req.query.patient_id || "P001";
