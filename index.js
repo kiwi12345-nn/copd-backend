@@ -26,11 +26,12 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 /* ============================================================
-   COPD CARE BACKEND V13
+   COPD CARE BACKEND V14
    - ID bệnh nhân tăng dần: 01, 02, 03...
    - Không fallback lấy dữ liệu bệnh nhân khác
    - Dữ liệu cảm biến lưu theo thiết bị được gán: devices.device_id -> patient_id
-   - Bác sĩ / Bệnh viện / Admin được gán nhanh thiết bị trên giao diện
+   - Bệnh nhân đăng nhập/tạo tài khoản sẽ tự nhận thiết bị COPD_01 trong phiên đang dùng
+   - Bác sĩ / Bệnh viện / Admin vẫn có thể gán nhanh thiết bị trên giao diện
    - Lịch sử đo chỉ lấy từ lúc tài khoản bệnh nhân được tạo
 ============================================================ */
 
@@ -281,6 +282,54 @@ async function logActivity(user, action, details = {}, patientId = null) {
   }
 }
 
+async function assignDeviceToPatientSystem(patientId, source = "AUTO_SESSION", user = null) {
+  const pid = String(patientId || "").trim();
+  if (!pid) return null;
+
+  const { data: patient, error: patientError } = await supabase
+    .from("patients")
+    .select("patient_id, full_name, hospital_id")
+    .eq("patient_id", pid)
+    .maybeSingle();
+
+  if (patientError || !patient) {
+    console.error("KHONG TIM THAY BENH NHAN DE GAN THIET BI:", pid, patientError?.message || "");
+    return null;
+  }
+
+  const now = new Date().toISOString();
+  const { data: device, error } = await supabase
+    .from("devices")
+    .upsert(
+      {
+        device_id: "COPD_01",
+        patient_id: pid,
+        device_name: "ESP32-S3 COPD Monitor",
+        active: true,
+        online: true,
+        last_seen_at: now,
+        updated_at: now,
+      },
+      { onConflict: "device_id" }
+    )
+    .select("*")
+    .single();
+
+  if (error) {
+    console.error("LOI AUTO GAN COPD_01:", error.message);
+    return null;
+  }
+
+  await logActivity(
+    user,
+    source,
+    { device_id: "COPD_01", patient_id: pid, patient_name: patient.full_name },
+    pid
+  );
+
+  return device;
+}
+
 function getAlertType(payload) {
   const msg = String(payload.message || payload.alert_message || "").toUpperCase();
   if (msg.includes("SPO2")) return "SpO2";
@@ -376,6 +425,13 @@ app.post("/api/auth/register", async (req, res) => {
   const { data, error } = await supabase.from("app_users").insert(userRow).select("*").single();
   if (error) return res.status(500).json({ error: error.message, message: "Không tạo được tài khoản người dùng" });
   const safeUser = await buildSafeUser(data);
+
+  // V14: nếu tài khoản bệnh nhân vừa được tạo và đang dùng app,
+  // tự gắn thiết bị COPD_01 cho bệnh nhân đó. Dữ liệu MQTT mới sẽ lưu vào đúng patient_id này.
+  if (safeUser.role === "patient" && safeUser.patient_id) {
+    await assignDeviceToPatientSystem(safeUser.patient_id, "AUTO_ASSIGN_ON_REGISTER", safeUser);
+  }
+
   await logActivity(safeUser, "REGISTER", { role, hospital_id: hospitalId }, patientId);
   return res.json({ token: tokenForUser(safeUser), user: safeUser, message: "Đăng ký thành công" });
 });
@@ -387,6 +443,13 @@ app.post("/api/auth/login", async (req, res) => {
   if (!error && dbUser) {
     if (!verifyPassword(dbUser.password_hash, password)) return res.status(401).json({ error: "LOGIN_FAILED", message: "Email hoặc mật khẩu không đúng" });
     const safeUser = await buildSafeUser(dbUser);
+
+    // V14: bệnh nhân nào đăng nhập thì thiết bị COPD_01 tự chuyển sang bệnh nhân đó.
+    // Đây là chế độ demo 1 thiết bị: tài khoản đang dùng sẽ nhận dữ liệu cảm biến mới.
+    if (safeUser.role === "patient" && safeUser.patient_id) {
+      await assignDeviceToPatientSystem(safeUser.patient_id, "AUTO_ASSIGN_ON_LOGIN", safeUser);
+    }
+
     await logActivity(safeUser, "LOGIN", { source: "app_users" }, safeUser.patient_id);
     return res.json({ token: tokenForUser(safeUser), user: safeUser });
   }
@@ -421,6 +484,34 @@ app.get("/api/devices", requireAuth, async (req, res) => {
   const { data, error } = await supabase.from("devices").select("*").order("device_id", { ascending: true });
   if (error) return res.status(500).json({ error: error.message, message: "Không tải được danh sách thiết bị" });
   return res.json(Array.isArray(data) ? data : []);
+});
+
+app.post("/api/devices/claim-current", requireAuth, async (req, res) => {
+  if (req.user.role !== "patient" || !req.user.patient_id) {
+    return res.status(403).json({
+      error: "FORBIDDEN",
+      message: "Chỉ tài khoản bệnh nhân mới tự nhận thiết bị đang dùng",
+    });
+  }
+
+  const device = await assignDeviceToPatientSystem(
+    req.user.patient_id,
+    "AUTO_ASSIGN_ACTIVE_SESSION",
+    req.user
+  );
+
+  if (!device) {
+    return res.status(500).json({
+      error: "ASSIGN_FAILED",
+      message: "Không tự gắn được thiết bị COPD_01 cho tài khoản đang đăng nhập",
+    });
+  }
+
+  return res.json({
+    success: true,
+    message: `Đã tự gắn COPD_01 cho bệnh nhân ${req.user.patient_id}`,
+    device,
+  });
 });
 
 app.post("/api/devices/assign", requireAuth, async (req, res) => {
@@ -635,8 +726,8 @@ mqttClient.on("message", async (topic, message) => {
 
 mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 
-app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V13", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V13_DEVICE_ASSIGN_AND_PATIENT_SEQUENCE", mqtt_connected: mqttClient.connected, mqtt_topic: MQTT_TOPIC, time: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V14", mqtt_topic: MQTT_TOPIC }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V14_AUTO_ASSIGN_ACTIVE_ACCOUNT", mqtt_connected: mqttClient.connected, mqtt_topic: MQTT_TOPIC, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = String(req.query.patient_id || "");
@@ -665,4 +756,4 @@ app.get("/api/alerts", async (req, res) => {
   return res.json(Array.isArray(data) ? data : []);
 });
 
-app.listen(PORT, () => console.log(`COPD BACKEND V13 RUNNING ON PORT ${PORT}`));
+app.listen(PORT, () => console.log(`COPD BACKEND V14 RUNNING ON PORT ${PORT}`));
