@@ -102,8 +102,23 @@ function makeId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
 }
 
-function makePatientId() {
+async function nextPatientId() {
+  const { data, error } = await supabase.rpc("next_patient_id");
+  if (!error && data) return String(data);
+  // fallback nếu RPC chưa chạy: vẫn tăng theo thời gian nhưng nên chạy SQL V9 để dùng P0001/P0002
   return `P${Date.now().toString().slice(-7)}`;
+}
+
+async function isPasswordAlreadyUsed(password) {
+  const { data, error } = await supabase
+    .from("app_users")
+    .select("password_hash")
+    .eq("active", true);
+  if (error || !Array.isArray(data)) return false;
+  for (const row of data) {
+    if (verifyPassword(row.password_hash, password)) return true;
+  }
+  return false;
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
@@ -125,6 +140,15 @@ function toNumber(value, defaultValue = 0) {
 
 function toBooleanReady(value) {
   return value === true || value === 1 || value === "1";
+}
+
+function buildDateRange(dateValue) {
+  if (!dateValue) return null;
+  const s = String(dateValue).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const start = new Date(`${s}T00:00:00.000Z`);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { start: start.toISOString(), end: end.toISOString() };
 }
 
 function getDefaultPatientIdForUser(user) {
@@ -259,8 +283,18 @@ app.post("/api/auth/register", async (req, res) => {
     return res.status(409).json({ error: "EMAIL_EXISTS", message: "Email này đã được đăng ký" });
   }
 
+  const passwordDuplicated = await isPasswordAlreadyUsed(password);
+  if (passwordDuplicated) {
+    return res.status(409).json({
+      error: "PASSWORD_ALREADY_USED",
+      message: "Mật khẩu này đã được tài khoản khác sử dụng. Vui lòng tạo mật khẩu khác để tránh trùng lặp."
+    });
+  }
+
   let hospitalId = body.hospital_id ? String(body.hospital_id).trim() : null;
   let patientId = body.patient_id ? String(body.patient_id).trim() : null;
+  const dateOfBirth = body.date_of_birth ? String(body.date_of_birth).trim() : null;
+  const age = body.age !== undefined && body.age !== null && String(body.age).trim() !== "" ? toNumber(body.age, null) : null;
   let allowedPatients = [];
 
   if (role === "hospital") {
@@ -286,7 +320,8 @@ app.post("/api/auth/register", async (req, res) => {
   }
 
   if (role === "patient") {
-    patientId = patientId || makePatientId();
+    // V9: bệnh nhân không nhập ID thủ công nữa. Hệ thống tự cấp P0001, P0002...
+    patientId = await nextPatientId();
     allowedPatients = [patientId];
 
     await supabase.from("patients").upsert(
@@ -295,6 +330,8 @@ app.post("/api/auth/register", async (req, res) => {
         full_name: fullName,
         phone,
         hospital_id: hospitalId,
+        date_of_birth: dateOfBirth,
+        age,
         diagnosis: "COPD cần theo dõi hô hấp",
         created_at: new Date().toISOString(),
       },
@@ -371,6 +408,8 @@ app.post("/api/auth/register", async (req, res) => {
     full_name: fullName,
     phone,
     role,
+    date_of_birth: role === "patient" ? dateOfBirth : null,
+    age: role === "patient" ? age : null,
     patient_id: patientId,
     hospital_id: hospitalId,
     allowed_patients: allowedPatients,
@@ -667,17 +706,35 @@ app.get("/api/my/latest", requireAuth, async (req, res) => {
 
 app.get("/api/my/history", requireAuth, async (req, res) => {
   const patientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user));
-  const limit = Math.min(Number(req.query.limit || 80), 200);
-  if (!canAccessPatient(req.user, patientId)) return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền xem dữ liệu bệnh nhân này" });
+  const limit = Math.min(Number(req.query.limit || 80), 500);
+  const dateRange = buildDateRange(req.query.date);
 
-  const { data, error } = await supabase
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền xem dữ liệu bệnh nhân này" });
+  }
+
+  let query = supabase
     .from("sensor_data")
     .select("*")
     .eq("patient_id", patientId)
     .order("timestamp", { ascending: false })
     .limit(limit);
 
+  if (dateRange) {
+    query = query.gte("timestamp", dateRange.start).lt("timestamp", dateRange.end);
+  }
+
+  const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
+
+  if (String(req.query.track || "") === "1") {
+    await logActivity(req.user, "VIEW_MEASUREMENT_HISTORY", {
+      patient_id: patientId,
+      date: req.query.date || "latest",
+      count: Array.isArray(data) ? data.length : 0,
+    }, patientId);
+  }
+
   res.json(Array.isArray(data) ? data : []);
 });
 
@@ -760,9 +817,35 @@ function getAlertType(payload) {
   return "General";
 }
 
+async function patientExists(patientId) {
+  const { data } = await supabase.from("patients").select("patient_id").eq("patient_id", patientId).maybeSingle();
+  return !!data;
+}
+
+async function resolveSensorPatientId(payload) {
+  const incoming = payload.patient_id ? String(payload.patient_id).trim() : "";
+  if (incoming && await patientExists(incoming)) return incoming;
+
+  const deviceId = payload.device || payload.device_id || "COPD_01";
+  const { data: device } = await supabase.from("devices").select("patient_id").eq("device_id", deviceId).maybeSingle();
+  if (device?.patient_id && await patientExists(String(device.patient_id))) return String(device.patient_id);
+
+  // Nếu ESP32 vẫn gửi P001 sau khi reset, backend tự gán vào bệnh nhân đầu tiên để tránh mất lịch sử đo.
+  // Khi có nhiều bệnh nhân, nên sửa firmware ESP32 gửi đúng patient_id được cấp trong app.
+  const { data: firstPatient } = await supabase
+    .from("patients")
+    .select("patient_id")
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (firstPatient?.patient_id) return String(firstPatient.patient_id);
+
+  return incoming || "P0001";
+}
+
 async function saveSensorData(payload) {
   const deviceId = payload.device || payload.device_id || "COPD_01";
-  const patientId = String(payload.patient_id || "P001");
+  const patientId = await resolveSensorPatientId(payload);
   const ready = toBooleanReady(payload.ready);
   const rr = toNumber(payload.rr, 0);
   const hr = toNumber(payload.hr, 0);
@@ -858,8 +941,8 @@ mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 // ============================================================
 // PUBLIC DASHBOARD LEGACY API
 // ============================================================
-app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V6", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V7_REAL_AUTH", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V8", mqtt_topic: MQTT_TOPIC }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V9_CLEAN_AUTO_PATIENT_ID", mqtt_connected: mqttClient.connected, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = req.query.patient_id || "P001";
@@ -871,7 +954,18 @@ app.get("/api/latest", async (req, res) => {
 app.get("/api/history", async (req, res) => {
   const patientId = req.query.patient_id || "P001";
   const limit = Math.min(toNumber(req.query.limit, 100), 500);
-  const { data, error } = await supabase.from("sensor_data").select("*").eq("patient_id", patientId).order("timestamp", { ascending: false }).limit(limit);
+  const dateRange = buildDateRange(req.query.date);
+
+  let query = supabase
+    .from("sensor_data")
+    .select("*")
+    .eq("patient_id", patientId)
+    .order("timestamp", { ascending: false })
+    .limit(limit);
+
+  if (dateRange) query = query.gte("timestamp", dateRange.start).lt("timestamp", dateRange.end);
+
+  const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(Array.isArray(data) ? data : []);
 });
@@ -884,4 +978,4 @@ app.get("/api/alerts", async (req, res) => {
   res.json(Array.isArray(data) ? data : []);
 });
 
-app.listen(PORT, () => console.log(`COPD BACKEND V6 RUNNING ON PORT ${PORT}`));
+app.listen(PORT, () => console.log(`COPD BACKEND V8 RUNNING ON PORT ${PORT}`));
