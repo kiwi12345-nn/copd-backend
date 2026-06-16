@@ -26,12 +26,11 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 /* ============================================================
-   COPD CARE BACKEND V14
+   COPD CARE BACKEND V22
    - ID bệnh nhân tăng dần: 01, 02, 03...
    - Không fallback lấy dữ liệu bệnh nhân khác
    - Dữ liệu cảm biến lưu theo thiết bị được gán: devices.device_id -> patient_id
-   - Bệnh nhân đăng nhập/tạo tài khoản sẽ tự nhận thiết bị COPD_01 trong phiên đang dùng
-   - Bác sĩ / Bệnh viện / Admin vẫn có thể gán nhanh thiết bị trên giao diện
+   - Bác sĩ / Bệnh viện / Admin được gán nhanh thiết bị trên giao diện
    - Lịch sử đo chỉ lấy từ lúc tài khoản bệnh nhân được tạo
 ============================================================ */
 
@@ -121,6 +120,66 @@ function toBooleanReady(value) {
   return value === true || value === 1 || value === "1" || value === "true";
 }
 
+function hasOwn(obj, key) {
+  return obj && Object.prototype.hasOwnProperty.call(obj, key) && obj[key] !== null && obj[key] !== undefined;
+}
+
+function boolFlag(obj, keys, defaultValue = false) {
+  for (const key of keys) {
+    if (hasOwn(obj, key)) return toBooleanReady(obj[key]);
+  }
+  return defaultValue;
+}
+
+function inRange(value, min, max) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= min && n <= max;
+}
+
+function normalizeLatestSensorRow(row) {
+  const latest = { ...(row || {}) };
+  if (latest.raw_payload && typeof latest.raw_payload === "object") {
+    Object.assign(latest, latest.raw_payload);
+  }
+
+  const rrRaw = toNumber(latest.rr, 0);
+  const spo2Raw = toNumber(latest.spo2, 0);
+  const hrRaw = toNumber(latest.hr, 0);
+  const tempRaw = toNumber(latest.temperature ?? latest.temp, 0);
+
+  const maxReady = boolFlag(latest, ["max_ready", "finger_detected", "spo2_hr_ready", "max30102_ready"],
+    toBooleanReady(latest.ready) && inRange(spo2Raw, 50, 100) && inRange(hrRaw, 30, 240));
+
+  const rrOk = boolFlag(latest, ["ui_show_rr", "rr_valid"], inRange(rrRaw, 3, 60)) && inRange(rrRaw, 3, 60);
+  const spo2Ok = maxReady && boolFlag(latest, ["ui_show_spo2", "spo2_valid"], inRange(spo2Raw, 50, 100)) && inRange(spo2Raw, 50, 100);
+  const hrOk = maxReady && boolFlag(latest, ["ui_show_hr", "hr_valid"], inRange(hrRaw, 30, 240)) && inRange(hrRaw, 30, 240);
+  const tempOk = boolFlag(latest, ["ui_show_temp", "temp_valid", "body_temp_ready"], inRange(tempRaw, 30, 45) && (rrOk || maxReady)) && inRange(tempRaw, 30, 45);
+  const fullOk = rrOk && spo2Ok && hrOk && tempOk;
+
+  latest.max_ready = maxReady ? 1 : 0;
+  latest.ui_show_rr = rrOk ? 1 : 0;
+  latest.ui_show_spo2 = spo2Ok ? 1 : 0;
+  latest.ui_show_hr = hrOk ? 1 : 0;
+  latest.ui_show_temp = tempOk ? 1 : 0;
+  latest.rr_valid = rrOk ? 1 : 0;
+  latest.spo2_valid = spo2Ok ? 1 : 0;
+  latest.hr_valid = hrOk ? 1 : 0;
+  latest.temp_valid = tempOk ? 1 : 0;
+  latest.full_vitals_ready = fullOk ? 1 : 0;
+  latest.device_worn = (rrOk || maxReady || tempOk || boolFlag(latest, ["device_worn", "worn"], false)) ? 1 : 0;
+
+  // Không trả số đo cũ/sai ra app. Nếu cờ hiển thị = 0 thì gửi 0 để Flutter hiển thị ---.
+  latest.rr = rrOk ? rrRaw : 0;
+  latest.hr = hrOk ? hrRaw : 0;
+  latest.spo2 = spo2Ok ? spo2Raw : 0;
+  latest.temperature = tempOk ? tempRaw : 0;
+  latest.temp = latest.temperature;
+  latest.temp_raw = tempRaw;
+  latest.ready = fullOk;
+  latest.alert_message = latest.alert_message || latest.current_message || latest.message || "DANG CAP NHAT DU LIEU CAM BIEN";
+  return latest;
+}
+
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
   const hash = crypto.createHash("sha256").update(`${salt}:${password}`).digest("hex");
   return `${salt}:${hash}`;
@@ -197,20 +256,14 @@ async function querySensorRowsForAccount(patientId, limit = 300, dateRange = nul
 }
 
 async function getLatestVitalsRow(patientId) {
-  const { data, error } = await querySensorRowsForAccount(patientId, 300, null);
+  const { data, error } = await querySensorRowsForAccount(patientId, 1, null);
   if (error) throw error;
   if (!Array.isArray(data) || data.length === 0) return null;
-  const latest = { ...data[0] };
-  const latestPositive = (key) => {
-    const found = data.find((r) => Number(r[key] ?? 0) > 0);
-    return found ? found[key] : latest[key];
-  };
-  latest.rr = latestPositive("rr");
-  latest.hr = latestPositive("hr");
-  latest.spo2 = latestPositive("spo2");
-  latest.temperature = latestPositive("temperature");
-  latest.ready = Number(latest.hr || 0) > 0 || Number(latest.spo2 || 0) > 0 || latest.ready === true;
-  latest.alert_message = latest.alert_message || latest.message || "DANG CAP NHAT DU LIEU CAM BIEN";
+
+  // Chỉ trả về bản ghi mới nhất đúng như ESP32 vừa gửi.
+  // KHÔNG lấy lại số đo dương cũ từ các bản ghi trước, vì khi bỏ tay khỏi MAX30102
+  // hoặc RR bị mất, app phải hiển thị --- để tránh lưu/hiển thị sai dữ liệu.
+  const latest = normalizeLatestSensorRow(data[0]);
   return latest;
 }
 
@@ -280,54 +333,6 @@ async function logActivity(user, action, details = {}, patientId = null) {
   } catch (err) {
     console.error("LOI LUU app_activity_logs:", err.message);
   }
-}
-
-async function assignDeviceToPatientSystem(patientId, source = "AUTO_SESSION", user = null) {
-  const pid = String(patientId || "").trim();
-  if (!pid) return null;
-
-  const { data: patient, error: patientError } = await supabase
-    .from("patients")
-    .select("patient_id, full_name, hospital_id")
-    .eq("patient_id", pid)
-    .maybeSingle();
-
-  if (patientError || !patient) {
-    console.error("KHONG TIM THAY BENH NHAN DE GAN THIET BI:", pid, patientError?.message || "");
-    return null;
-  }
-
-  const now = new Date().toISOString();
-  const { data: device, error } = await supabase
-    .from("devices")
-    .upsert(
-      {
-        device_id: "COPD_01",
-        patient_id: pid,
-        device_name: "ESP32-S3 COPD Monitor",
-        active: true,
-        online: true,
-        last_seen_at: now,
-        updated_at: now,
-      },
-      { onConflict: "device_id" }
-    )
-    .select("*")
-    .single();
-
-  if (error) {
-    console.error("LOI AUTO GAN COPD_01:", error.message);
-    return null;
-  }
-
-  await logActivity(
-    user,
-    source,
-    { device_id: "COPD_01", patient_id: pid, patient_name: patient.full_name },
-    pid
-  );
-
-  return device;
 }
 
 function getAlertType(payload) {
@@ -425,13 +430,6 @@ app.post("/api/auth/register", async (req, res) => {
   const { data, error } = await supabase.from("app_users").insert(userRow).select("*").single();
   if (error) return res.status(500).json({ error: error.message, message: "Không tạo được tài khoản người dùng" });
   const safeUser = await buildSafeUser(data);
-
-  // V14: nếu tài khoản bệnh nhân vừa được tạo và đang dùng app,
-  // tự gắn thiết bị COPD_01 cho bệnh nhân đó. Dữ liệu MQTT mới sẽ lưu vào đúng patient_id này.
-  if (safeUser.role === "patient" && safeUser.patient_id) {
-    await assignDeviceToPatientSystem(safeUser.patient_id, "AUTO_ASSIGN_ON_REGISTER", safeUser);
-  }
-
   await logActivity(safeUser, "REGISTER", { role, hospital_id: hospitalId }, patientId);
   return res.json({ token: tokenForUser(safeUser), user: safeUser, message: "Đăng ký thành công" });
 });
@@ -443,13 +441,6 @@ app.post("/api/auth/login", async (req, res) => {
   if (!error && dbUser) {
     if (!verifyPassword(dbUser.password_hash, password)) return res.status(401).json({ error: "LOGIN_FAILED", message: "Email hoặc mật khẩu không đúng" });
     const safeUser = await buildSafeUser(dbUser);
-
-    // V14: bệnh nhân nào đăng nhập thì thiết bị COPD_01 tự chuyển sang bệnh nhân đó.
-    // Đây là chế độ demo 1 thiết bị: tài khoản đang dùng sẽ nhận dữ liệu cảm biến mới.
-    if (safeUser.role === "patient" && safeUser.patient_id) {
-      await assignDeviceToPatientSystem(safeUser.patient_id, "AUTO_ASSIGN_ON_LOGIN", safeUser);
-    }
-
     await logActivity(safeUser, "LOGIN", { source: "app_users" }, safeUser.patient_id);
     return res.json({ token: tokenForUser(safeUser), user: safeUser });
   }
@@ -484,34 +475,6 @@ app.get("/api/devices", requireAuth, async (req, res) => {
   const { data, error } = await supabase.from("devices").select("*").order("device_id", { ascending: true });
   if (error) return res.status(500).json({ error: error.message, message: "Không tải được danh sách thiết bị" });
   return res.json(Array.isArray(data) ? data : []);
-});
-
-app.post("/api/devices/claim-current", requireAuth, async (req, res) => {
-  if (req.user.role !== "patient" || !req.user.patient_id) {
-    return res.status(403).json({
-      error: "FORBIDDEN",
-      message: "Chỉ tài khoản bệnh nhân mới tự nhận thiết bị đang dùng",
-    });
-  }
-
-  const device = await assignDeviceToPatientSystem(
-    req.user.patient_id,
-    "AUTO_ASSIGN_ACTIVE_SESSION",
-    req.user
-  );
-
-  if (!device) {
-    return res.status(500).json({
-      error: "ASSIGN_FAILED",
-      message: "Không tự gắn được thiết bị COPD_01 cho tài khoản đang đăng nhập",
-    });
-  }
-
-  return res.json({
-    success: true,
-    message: `Đã tự gắn COPD_01 cho bệnh nhân ${req.user.patient_id}`,
-    device,
-  });
 });
 
 app.post("/api/devices/assign", requireAuth, async (req, res) => {
@@ -674,11 +637,14 @@ async function saveSensorData(payload) {
     return;
   }
 
-  const ready = toBooleanReady(payload.ready);
-  const rr = toNumber(payload.rr, 0);
-  const hr = toNumber(payload.hr, 0);
-  const spo2 = toNumber(payload.spo2, 0);
-  const temperature = toNumber(payload.temp ?? payload.temperature, 0);
+  // Chuẩn hóa dữ liệu ngay lúc lưu: nếu ESP báo cảm biến không hợp lệ thì lưu 0.
+  // raw_payload vẫn giữ toàn bộ gói MQTT gốc để debug và hiển thị trạng thái dự báo.
+  const normalized = normalizeLatestSensorRow({ ...payload, raw_payload: payload });
+  const ready = !!normalized.ready;
+  const rr = toNumber(normalized.rr, 0);
+  const hr = toNumber(normalized.hr, 0);
+  const spo2 = toNumber(normalized.spo2, 0);
+  const temperature = toNumber(normalized.temp ?? normalized.temperature, 0);
   const flexRaw = toNumber(payload.flex_raw, 0);
   const flexFiltered = toNumber(payload.flex_filtered, 0);
   const flexBaseline = toNumber(payload.flex_baseline, 0);
@@ -726,8 +692,8 @@ mqttClient.on("message", async (topic, message) => {
 
 mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 
-app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V14", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V14_AUTO_ASSIGN_ACTIVE_ACCOUNT", mqtt_connected: mqttClient.connected, mqtt_topic: MQTT_TOPIC, time: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V22", mqtt_topic: MQTT_TOPIC }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V22_PREDICT_FIELDS_RAW_PAYLOAD_NO_OLD_VITALS", mqtt_connected: mqttClient.connected, mqtt_topic: MQTT_TOPIC, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = String(req.query.patient_id || "");
@@ -756,4 +722,4 @@ app.get("/api/alerts", async (req, res) => {
   return res.json(Array.isArray(data) ? data : []);
 });
 
-app.listen(PORT, () => console.log(`COPD BACKEND V14 RUNNING ON PORT ${PORT}`));
+app.listen(PORT, () => console.log(`COPD BACKEND V22 RUNNING ON PORT ${PORT}`));
