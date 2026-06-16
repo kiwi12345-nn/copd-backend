@@ -496,6 +496,72 @@ app.post("/api/devices/assign", requireAuth, async (req, res) => {
   }
 });
 
+
+// ============================================================
+// V27: TÀI KHOẢN ĐANG ĐĂNG NHẬP TỰ NHẬN THIẾT BỊ DEMO
+// Mục tiêu: không cần bệnh viện gắn thiết bị thủ công.
+// App đăng nhập tài khoản nào thì backend gán COPD_01 cho patient_id của tài khoản đó.
+// MQTT sau đó sẽ được lưu vào đúng tài khoản và tab Lịch sử đo của tài khoản đó.
+// ============================================================
+app.post("/api/devices/claim-current", requireAuth, async (req, res) => {
+  try {
+    const deviceId = String(req.body?.device_id || "COPD_01").trim();
+    const requestedPatientId = String(req.body?.patient_id || "").trim();
+    const patientId = requestedPatientId || String(getDefaultPatientIdForUser(req.user) || "").trim();
+
+    if (!deviceId) {
+      return res.status(400).json({ error: "MISSING_DEVICE_ID", message: "Thiếu mã thiết bị" });
+    }
+    if (!patientId) {
+      return res.status(400).json({ error: "MISSING_PATIENT_ID", message: "Tài khoản chưa có mã bệnh nhân để nhận thiết bị" });
+    }
+    if (!canAccessPatient(req.user, patientId)) {
+      return res.status(403).json({ error: "FORBIDDEN", message: "Tài khoản này không có quyền nhận dữ liệu cho bệnh nhân này" });
+    }
+
+    const { data: patient, error: patientError } = await supabase
+      .from("patients")
+      .select("patient_id, full_name")
+      .eq("patient_id", patientId)
+      .maybeSingle();
+
+    if (patientError || !patient) {
+      return res.status(404).json({ error: "PATIENT_NOT_FOUND", message: "Không tìm thấy hồ sơ bệnh nhân của tài khoản đang đăng nhập" });
+    }
+
+    const now = new Date().toISOString();
+    const { data: device, error } = await supabase
+      .from("devices")
+      .upsert({
+        device_id: deviceId,
+        patient_id: patientId,
+        device_name: deviceId === "COPD_01" ? "ESP32-S3 COPD Monitor" : "COPD Care Device",
+        active: true,
+        online: true,
+        last_seen_at: now,
+        updated_at: now,
+        created_at: now
+      }, { onConflict: "device_id" })
+      .select("*")
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message, message: "Không kích hoạt được thiết bị cho tài khoản hiện tại" });
+    }
+
+    await logActivity(req.user, "CLAIM_CURRENT_DEVICE", { device_id: deviceId, patient_name: patient.full_name }, patientId);
+
+    return res.json({
+      success: true,
+      message: `Thiết bị ${deviceId} đang gửi dữ liệu cho tài khoản bệnh nhân ${patientId}`,
+      patient_id: patientId,
+      device
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, message: "Lỗi server khi kích hoạt thiết bị cho tài khoản hiện tại" });
+  }
+});
+
 function canManageAppointments(user) {
   return user && ["admin", "doctor", "hospital"].includes(user.role);
 }
@@ -619,11 +685,38 @@ async function patientExists(patientId) {
 
 async function resolveSensorPatientId(payload) {
   const deviceId = String(payload.device || payload.device_id || "COPD_01");
-  const { data: device, error } = await supabase.from("devices").select("patient_id, active").eq("device_id", deviceId).maybeSingle();
-  if (!error && device?.active && device?.patient_id) {
+
+  // V27: Ưu tiên thiết bị đang được tài khoản đăng nhập nhận bằng /api/devices/claim-current.
+  // Như vậy tài khoản nào đang đăng nhập và đeo cảm biến thì dữ liệu MQTT sẽ lưu vào đúng tài khoản đó.
+  const { data: device, error } = await supabase
+    .from("devices")
+    .select("patient_id, active")
+    .eq("device_id", deviceId)
+    .maybeSingle();
+
+  if (!error && device?.patient_id) {
     const pid = String(device.patient_id);
     if (await patientExists(pid)) return pid;
   }
+
+  // Dự phòng: nếu ESP32 vẫn gửi patient_id trực tiếp thì dùng khi chưa có mapping thiết bị.
+  const directPatientId = String(payload.patient_id || payload.patientId || payload.patient || "").trim();
+  if (directPatientId && await patientExists(directPatientId)) return directPatientId;
+
+  // Dự phòng cho ngày demo: dùng DEFAULT_PATIENT_ID hoặc DEMO_PATIENT_ID nếu có khai báo trên Render.
+  const envPatientId = String(process.env.DEFAULT_PATIENT_ID || process.env.DEMO_PATIENT_ID || "").trim();
+  if (envPatientId && await patientExists(envPatientId)) return envPatientId;
+
+  // Dự phòng cuối: chọn bệnh nhân được tạo mới nhất để MQTT không bị rơi mất dữ liệu khi demo.
+  const { data: newestPatient } = await supabase
+    .from("patients")
+    .select("patient_id")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (newestPatient?.patient_id) return String(newestPatient.patient_id);
+
   return null;
 }
 
@@ -667,6 +760,37 @@ async function saveSensorData(payload) {
     const { error: alertError } = await supabase.from("alerts_log").insert({ patient_id: patientId, device_id: deviceId, alert_level: alertLevel, alert_type: alertType, alert_value: spo2 || hr || rr || temperature || 0, threshold_value: 0, message: alertMessage || "CANH BAO TU THIET BI", timestamp: now });
     if (alertError) console.error("LOI LUU alerts_log:", alertError.message);
   }
+
+  // V27: lưu cả hoạt động cảnh báo sớm nếu ESP32 đã dự báo mức nguy cơ > 0.
+  const predictReady = toNumber(payload.predict_ready || payload.early_warning_ready || 0, 0) === 1;
+  const predictLevel = toNumber(payload.predict_level || payload.early_warning_level || 0, 0);
+  const predictCount = String(payload.predict_count || "").trim();
+  const predictMessage = String(payload.predict_conclusion || payload.predict_message || payload.early_warning_conclusion || payload.early_warning_message || "").trim();
+  if (predictReady && predictLevel > 0) {
+    const earlyMessage = `[Dự báo #${predictCount || "?"}] ${predictMessage || "CANH BAO SOM TU THIET BI"}`;
+    const { data: existed } = await supabase
+      .from("alerts_log")
+      .select("id")
+      .eq("patient_id", patientId)
+      .eq("device_id", deviceId)
+      .eq("alert_type", "EARLY_WARNING")
+      .eq("message", earlyMessage)
+      .limit(1)
+      .maybeSingle();
+    if (!existed) {
+      const { error: earlyAlertError } = await supabase.from("alerts_log").insert({
+        patient_id: patientId,
+        device_id: deviceId,
+        alert_level: predictLevel,
+        alert_type: "EARLY_WARNING",
+        alert_value: predictLevel,
+        threshold_value: 0,
+        message: earlyMessage,
+        timestamp: now
+      });
+      if (earlyAlertError) console.error("LOI LUU early_warning alerts_log:", earlyAlertError.message);
+    }
+  }
 }
 
 const mqttClientId = `copd_backend_${Math.random().toString(16).slice(2)}`;
@@ -692,8 +816,8 @@ mqttClient.on("message", async (topic, message) => {
 
 mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 
-app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V22", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V22_PREDICT_FIELDS_RAW_PAYLOAD_NO_OLD_VITALS", mqtt_connected: mqttClient.connected, mqtt_topic: MQTT_TOPIC, time: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V27", mqtt_topic: MQTT_TOPIC }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V27_ACTIVE_ACCOUNT_AUTO_CLAIM_AND_HISTORY", mqtt_connected: mqttClient.connected, mqtt_topic: MQTT_TOPIC, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = String(req.query.patient_id || "");
