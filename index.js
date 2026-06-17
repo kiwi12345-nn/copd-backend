@@ -562,6 +562,32 @@ app.post("/api/devices/claim-current", requireAuth, async (req, res) => {
   }
 });
 
+// Khi người dùng đăng xuất: ngừng gán thiết bị cho tài khoản đó.
+// Nếu chỉ tắt/thoát app mà chưa đăng xuất thì endpoint này KHÔNG được gọi, thiết bị vẫn lưu dữ liệu cho tài khoản đang đăng nhập.
+app.post("/api/devices/release-current", requireAuth, async (req, res) => {
+  try {
+    const deviceId = String(req.body?.device_id || "COPD_01").trim();
+    const requestedPatientId = String(req.body?.patient_id || "").trim();
+    const patientId = requestedPatientId || String(getDefaultPatientIdForUser(req.user) || "").trim();
+
+    if (!deviceId) return res.status(400).json({ error: "MISSING_DEVICE_ID", message: "Thiếu mã thiết bị" });
+    if (patientId && !canAccessPatient(req.user, patientId)) {
+      return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền bỏ gán thiết bị cho bệnh nhân này" });
+    }
+
+    const now = new Date().toISOString();
+    let query = supabase.from("devices").update({ active: false, online: false, updated_at: now }).eq("device_id", deviceId);
+    if (patientId) query = query.eq("patient_id", patientId);
+    const { data, error } = await query.select("*").maybeSingle();
+    if (error) return res.status(500).json({ error: error.message, message: "Không bỏ gán được thiết bị" });
+
+    await logActivity(req.user, "RELEASE_CURRENT_DEVICE", { device_id: deviceId }, patientId || null);
+    return res.json({ success: true, message: `Đã đăng xuất và ngừng lưu dữ liệu mới từ ${deviceId} cho tài khoản này`, device: data || null });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, message: "Lỗi server khi bỏ gán thiết bị" });
+  }
+});
+
 function canManageAppointments(user) {
   return user && ["admin", "doctor", "hospital"].includes(user.role);
 }
@@ -592,7 +618,7 @@ app.post("/api/my/appointments", requireAuth, async (req, res) => {
   const { data, error } = await supabase.from("doctor_appointments").insert(row).select("*").single();
   if (error) return res.status(500).json({ error: error.message });
   await logActivity(req.user, "CREATE_APPOINTMENT", { appointment_id: data.appointment_id, doctor_id: doctorId, appointment_date: appointmentDate, appointment_time: appointmentTime }, patientId);
-  return res.json({ success: true, appointment: data, message: `Đã đặt lịch. Số thứ tự trong khung ${appointmentTime} là ${data.queue_number}` });
+  return res.json({ success: true, appointment: data, message: `Đã đặt lịch và gửi thông báo đến bệnh viện. Số thứ tự trong khung ${appointmentTime} là ${data.queue_number}` });
 });
 
 app.get("/api/my/appointments", requireAuth, async (req, res) => {
@@ -694,9 +720,15 @@ async function resolveSensorPatientId(payload) {
     .eq("device_id", deviceId)
     .maybeSingle();
 
-  if (!error && device?.patient_id) {
-    const pid = String(device.patient_id);
-    if (await patientExists(pid)) return pid;
+  if (!error && device) {
+    // Nếu người dùng đã đăng xuất, release-current đặt active=false.
+    // Khi đó ESP32 vẫn có thể gửi MQTT nhưng backend không lưu vào tài khoản cũ nữa.
+    if (device.active === false) return null;
+    if (device.patient_id) {
+      const pid = String(device.patient_id);
+      if (await patientExists(pid)) return pid;
+    }
+    return null;
   }
 
   // Dự phòng: nếu ESP32 vẫn gửi patient_id trực tiếp thì dùng khi chưa có mapping thiết bị.
