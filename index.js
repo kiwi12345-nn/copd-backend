@@ -26,12 +26,12 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 /* ============================================================
-   COPD CARE BACKEND V22
-   - ID bệnh nhân tăng dần: 01, 02, 03...
-   - Không fallback lấy dữ liệu bệnh nhân khác
+   COPD CARE BACKEND V30 - 3 ROLE UI
+   - Giao diện app chỉ dùng: patient, family, hospital
+   - Admin chỉ giữ trong app_users để quản lý dữ liệu trên Supabase
+   - Không dùng giao diện bác sĩ và không dùng bảng doctors
+   - Lịch khám dùng bảng appointments
    - Dữ liệu cảm biến lưu theo thiết bị được gán: devices.device_id -> patient_id
-   - Bác sĩ / Bệnh viện / Admin được gán nhanh thiết bị trên giao diện
-   - Lịch sử đo chỉ lấy từ lúc tài khoản bệnh nhân được tạo
 ============================================================ */
 
 function base64url(input) {
@@ -285,7 +285,7 @@ async function getAllowedPatientsForUser(user) {
     const { data } = await supabase.from("patients").select("patient_id").order("patient_id", { ascending: true }).limit(1000);
     return Array.isArray(data) ? data.map((r) => String(r.patient_id)) : [];
   }
-  if (user.role === "hospital" || user.role === "doctor") {
+  if (user.role === "hospital") {
     if (!user.hospital_id) return [];
     const { data } = await supabase
       .from("hospital_patient_links")
@@ -357,7 +357,7 @@ app.post("/api/auth/register", async (req, res) => {
   const fullName = String(body.full_name || "").trim();
   const phone = String(body.phone || "").trim();
   const role = String(body.role || "patient").trim();
-  const allowedRoles = ["patient", "family", "doctor", "hospital", "admin"];
+  const allowedRoles = ["patient", "family", "hospital", "admin"];
 
   if (!email || !password || password.length < 6 || !fullName) return res.status(400).json({ error: "MISSING_FIELDS", message: "Cần nhập họ tên, email và mật khẩu tối thiểu 6 ký tự" });
   if (!allowedRoles.includes(role)) return res.status(400).json({ error: "INVALID_ROLE", message: "Vai trò không hợp lệ" });
@@ -391,7 +391,7 @@ app.post("/api/auth/register", async (req, res) => {
     if (hospitalError) return res.status(500).json({ error: hospitalError.message, message: "Không tạo được tài khoản bệnh viện" });
   }
 
-  if (["patient", "family", "doctor"].includes(role) && !hospitalId) return res.status(400).json({ error: "MISSING_HOSPITAL", message: "Cần chọn bệnh viện đã đăng ký trên hệ thống" });
+  if (["patient", "family"].includes(role) && !hospitalId) return res.status(400).json({ error: "MISSING_HOSPITAL", message: "Cần chọn bệnh viện đã đăng ký trên hệ thống" });
 
   if (role === "patient") {
     patientId = await nextPatientId();
@@ -416,13 +416,6 @@ app.post("/api/auth/register", async (req, res) => {
     const { data: linkedPatient } = await supabase.from("hospital_patient_links").select("patient_id").eq("hospital_id", hospitalId).eq("patient_id", patientId).eq("status", "active").maybeSingle();
     if (!linkedPatient) return res.status(404).json({ error: "PATIENT_NOT_FOUND_IN_HOSPITAL", message: "Không tìm thấy mã bệnh nhân này trong bệnh viện đã chọn" });
     allowedPatients = [patientId];
-  }
-
-  if (role === "doctor") {
-    allowedPatients = [];
-    const doctorId = `D${Date.now().toString().slice(-7)}`;
-    const { data: hospital } = await supabase.from("hospitals").select("hospital_name").eq("hospital_id", hospitalId).maybeSingle();
-    await supabase.from("doctors").insert({ doctor_id: doctorId, hospital_id: hospitalId, full_name: fullName, specialty: String(body.specialty || "Hô hấp - COPD"), hospital: hospital?.hospital_name || "Bệnh viện đã đăng ký", experience_years: toNumber(body.experience_years, 0), price: toNumber(body.price, 0), location: "Tư vấn online", rating: 5, created_at: new Date().toISOString() });
   }
 
   const now = new Date().toISOString();
@@ -465,13 +458,13 @@ app.get("/api/patient/full", requireAuth, async (req, res) => {
     supabase.from("sensor_data").select("*").eq("patient_id", patientId).order("timestamp", { ascending: false }).limit(1).maybeSingle(),
     querySensorRowsForAccount(patientId, 80, null),
     supabase.from("alerts_log").select("*").eq("patient_id", patientId).order("timestamp", { ascending: false }).limit(30),
-    supabase.from("doctor_appointments").select("*").eq("patient_id", patientId).order("appointment_date", { ascending: true }).order("appointment_time", { ascending: true }).limit(50),
+    supabase.from("appointments").select("*").eq("patient_id", patientId).order("appointment_date", { ascending: true }).order("appointment_time", { ascending: true }).limit(50),
   ]);
   return res.json({ profile: profile.data || null, latest: latest.data || null, history: Array.isArray(history.data) ? history.data : [], alerts: Array.isArray(alerts.data) ? alerts.data : [], appointments: Array.isArray(appointments.data) ? appointments.data : [] });
 });
 
 app.get("/api/devices", requireAuth, async (req, res) => {
-  if (!["doctor", "hospital", "admin"].includes(req.user.role)) return res.status(403).json({ error: "FORBIDDEN", message: "Chỉ bác sĩ, bệnh viện hoặc admin được xem thiết bị" });
+  if (!["hospital", "admin"].includes(req.user.role)) return res.status(403).json({ error: "FORBIDDEN", message: "Chỉ bệnh viện hoặc admin được xem thiết bị" });
   const { data, error } = await supabase.from("devices").select("*").order("device_id", { ascending: true });
   if (error) return res.status(500).json({ error: error.message, message: "Không tải được danh sách thiết bị" });
   return res.json(Array.isArray(data) ? data : []);
@@ -479,7 +472,7 @@ app.get("/api/devices", requireAuth, async (req, res) => {
 
 app.post("/api/devices/assign", requireAuth, async (req, res) => {
   try {
-    if (!["doctor", "hospital", "admin"].includes(req.user.role)) return res.status(403).json({ error: "FORBIDDEN", message: "Chỉ bác sĩ, bệnh viện hoặc admin được gắn thiết bị" });
+    if (!["hospital", "admin"].includes(req.user.role)) return res.status(403).json({ error: "FORBIDDEN", message: "Chỉ bệnh viện hoặc admin được gắn thiết bị" });
     const deviceId = String(req.body?.device_id || "COPD_01").trim();
     const patientId = String(req.body?.patient_id || "").trim();
     if (!deviceId || !patientId) return res.status(400).json({ error: "MISSING_FIELDS", message: "Thiếu device_id hoặc patient_id" });
@@ -589,50 +582,96 @@ app.post("/api/devices/release-current", requireAuth, async (req, res) => {
 });
 
 function canManageAppointments(user) {
-  return user && ["admin", "doctor", "hospital"].includes(user.role);
+  return user && ["admin", "hospital"].includes(user.role);
 }
-
-app.get("/api/doctors", requireAuth, async (req, res) => {
-  let query = supabase.from("doctors").select("*").order("full_name", { ascending: true });
-  if (["patient", "family", "doctor", "hospital"].includes(req.user.role) && req.user.hospital_id) query = query.eq("hospital_id", req.user.hospital_id);
-  const { data, error } = await query;
-  if (error || !Array.isArray(data) || data.length === 0) return res.json([{ doctor_id: "D001", hospital_id: req.user.hospital_id || null, full_name: "BS. Hô hấp COPD", specialty: "Hô hấp - COPD", hospital: "Bệnh viện đã đăng ký", experience_years: 8, price: 150000, location: "Tư vấn online", rating: 4.8 }]);
-  return res.json(data);
-});
 
 app.post("/api/my/appointments", requireAuth, async (req, res) => {
   const body = req.body || {};
-  const doctorId = String(body.doctor_id || "D001");
   const appointmentDate = String(body.appointment_date || "").trim();
   const appointmentTime = String(body.appointment_time || "").trim();
   const reason = String(body.reason || "Tái khám COPD định kỳ").trim();
-  const patientId = String(body.patient_id || getDefaultPatientIdForUser(req.user) || "");
-  if (!canAccessPatient(req.user, patientId)) return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền đặt lịch cho bệnh nhân này" });
-  if (!appointmentDate || !appointmentTime) return res.status(400).json({ error: "MISSING_FIELDS", message: "Thiếu ngày hoặc khung giờ khám" });
-  const { data: doctor } = await supabase.from("doctors").select("doctor_id,hospital_id,full_name").eq("doctor_id", doctorId).maybeSingle();
-  const hospitalId = doctor?.hospital_id || req.user.hospital_id || null;
-  const { data: lastRows, error: queueError } = await supabase.from("doctor_appointments").select("queue_number").eq("doctor_id", doctorId).eq("appointment_date", appointmentDate).eq("appointment_time", appointmentTime).order("queue_number", { ascending: false }).limit(1);
+  const patientId = String(body.patient_id || getDefaultPatientIdForUser(req.user) || "").trim();
+
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền đặt lịch cho bệnh nhân này" });
+  }
+  if (!appointmentDate || !appointmentTime) {
+    return res.status(400).json({ error: "MISSING_FIELDS", message: "Thiếu ngày hoặc khung giờ khám" });
+  }
+
+  const { data: patient } = await supabase
+    .from("patients")
+    .select("patient_id, full_name, hospital_id")
+    .eq("patient_id", patientId)
+    .maybeSingle();
+
+  const hospitalId = String(body.hospital_id || patient?.hospital_id || req.user.hospital_id || "").trim();
+  if (!hospitalId) {
+    return res.status(400).json({ error: "MISSING_HOSPITAL", message: "Không xác định được bệnh viện của bệnh nhân" });
+  }
+
+  const { data: lastRows, error: queueError } = await supabase
+    .from("appointments")
+    .select("queue_number")
+    .eq("hospital_id", hospitalId)
+    .eq("appointment_date", appointmentDate)
+    .eq("appointment_time", appointmentTime)
+    .order("queue_number", { ascending: false })
+    .limit(1);
   if (queueError) return res.status(500).json({ error: queueError.message });
+
   const lastQueue = Array.isArray(lastRows) && lastRows.length > 0 ? Number(lastRows[0].queue_number || 0) : 0;
-  const row = { doctor_id: doctorId, hospital_id: hospitalId, patient_id: patientId, patient_name: body.patient_name || req.user.full_name || patientId, requester_user_id: req.user.user_id, requester_name: req.user.full_name, requester_role: req.user.role, appointment_date: appointmentDate, appointment_time: appointmentTime, queue_number: lastQueue + 1, reason, status: "pending", created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
-  const { data, error } = await supabase.from("doctor_appointments").insert(row).select("*").single();
+  const row = {
+    hospital_id: hospitalId,
+    patient_id: patientId,
+    patient_name: body.patient_name || patient?.full_name || req.user.full_name || patientId,
+    requester_user_id: req.user.user_id,
+    requester_name: req.user.full_name,
+    requester_role: req.user.role,
+    appointment_date: appointmentDate,
+    appointment_time: appointmentTime,
+    queue_number: lastQueue + 1,
+    reason,
+    status: "pending",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  const { data, error } = await supabase.from("appointments").insert(row).select("*").single();
   if (error) return res.status(500).json({ error: error.message });
-  await logActivity(req.user, "CREATE_APPOINTMENT", { appointment_id: data.appointment_id, doctor_id: doctorId, appointment_date: appointmentDate, appointment_time: appointmentTime }, patientId);
+
+  await logActivity(req.user, "CREATE_APPOINTMENT", { appointment_id: data.appointment_id, hospital_id: hospitalId, appointment_date: appointmentDate, appointment_time: appointmentTime }, patientId);
   return res.json({ success: true, appointment: data, message: `Đã đặt lịch và gửi thông báo đến bệnh viện. Số thứ tự trong khung ${appointmentTime} là ${data.queue_number}` });
 });
 
 app.get("/api/my/appointments", requireAuth, async (req, res) => {
-  const patientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "");
-  if (!canAccessPatient(req.user, patientId)) return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền xem lịch của bệnh nhân này" });
-  const { data, error } = await supabase.from("doctor_appointments").select("*").eq("patient_id", patientId).order("appointment_date", { ascending: true }).order("appointment_time", { ascending: true }).order("queue_number", { ascending: true }).limit(100);
+  const patientId = String(req.query.patient_id || getDefaultPatientIdForUser(req.user) || "").trim();
+  if (!canAccessPatient(req.user, patientId)) {
+    return res.status(403).json({ error: "FORBIDDEN", message: "Bạn không có quyền xem lịch của bệnh nhân này" });
+  }
+  const { data, error } = await supabase
+    .from("appointments")
+    .select("*")
+    .eq("patient_id", patientId)
+    .order("appointment_date", { ascending: true })
+    .order("appointment_time", { ascending: true })
+    .order("queue_number", { ascending: true })
+    .limit(100);
   if (error) return res.status(500).json({ error: error.message });
   return res.json(Array.isArray(data) ? data : []);
 });
 
-app.get("/api/doctor/appointments", requireAuth, async (req, res) => {
-  if (!canManageAppointments(req.user)) return res.status(403).json({ error: "FORBIDDEN", message: "Chỉ bác sĩ/bệnh viện/admin được xem danh sách lịch hẹn" });
+app.get("/api/hospital/appointments", requireAuth, async (req, res) => {
+  if (!canManageAppointments(req.user)) {
+    return res.status(403).json({ error: "FORBIDDEN", message: "Chỉ bệnh viện hoặc admin được xem danh sách lịch hẹn" });
+  }
   const status = String(req.query.status || "").trim();
-  let query = supabase.from("doctor_appointments").select("*").order("appointment_date", { ascending: true }).order("appointment_time", { ascending: true }).order("queue_number", { ascending: true });
+  let query = supabase
+    .from("appointments")
+    .select("*")
+    .order("appointment_date", { ascending: true })
+    .order("appointment_time", { ascending: true })
+    .order("queue_number", { ascending: true });
   if (req.user.role !== "admin" && req.user.hospital_id) query = query.eq("hospital_id", req.user.hospital_id);
   if (status) query = query.eq("status", status);
   const { data, error } = await query.limit(300);
@@ -640,12 +679,19 @@ app.get("/api/doctor/appointments", requireAuth, async (req, res) => {
   return res.json(Array.isArray(data) ? data : []);
 });
 
-app.patch("/api/doctor/appointments/:id/status", requireAuth, async (req, res) => {
-  if (!canManageAppointments(req.user)) return res.status(403).json({ error: "FORBIDDEN", message: "Chỉ bác sĩ/bệnh viện/admin được cập nhật lịch hẹn" });
+app.patch("/api/hospital/appointments/:id/status", requireAuth, async (req, res) => {
+  if (!canManageAppointments(req.user)) {
+    return res.status(403).json({ error: "FORBIDDEN", message: "Chỉ bệnh viện hoặc admin được cập nhật lịch hẹn" });
+  }
   const status = String(req.body?.status || "").trim();
   const allowed = ["pending", "confirmed", "done", "cancelled"];
   if (!allowed.includes(status)) return res.status(400).json({ error: "INVALID_STATUS", message: "Trạng thái không hợp lệ" });
-  const { data, error } = await supabase.from("doctor_appointments").update({ status, updated_at: new Date().toISOString() }).eq("appointment_id", req.params.id).select("*").single();
+  const { data, error } = await supabase
+    .from("appointments")
+    .update({ status, updated_at: new Date().toISOString() })
+    .eq("appointment_id", req.params.id)
+    .select("*")
+    .single();
   if (error) return res.status(500).json({ error: error.message });
   await logActivity(req.user, "UPDATE_APPOINTMENT_STATUS", { appointment_id: req.params.id, status }, data.patient_id);
   return res.json({ success: true, appointment: data });
@@ -698,7 +744,7 @@ app.get("/api/my/activity", requireAuth, async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 50), 100);
   let query = supabase.from("app_activity_logs").select("*").order("created_at", { ascending: false }).limit(limit);
   if (req.user.role === "patient" || req.user.role === "family") query = query.eq("user_id", req.user.user_id);
-  else if (req.user.role === "hospital" || req.user.role === "doctor") query = query.eq("hospital_id", req.user.hospital_id);
+  else if (req.user.role === "hospital") query = query.eq("hospital_id", req.user.hospital_id);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   return res.json(Array.isArray(data) ? data : []);
@@ -848,8 +894,8 @@ mqttClient.on("message", async (topic, message) => {
 
 mqttClient.on("error", (err) => console.error("MQTT ERROR:", err.message));
 
-app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V27", mqtt_topic: MQTT_TOPIC }));
-app.get("/health", (req, res) => res.json({ status: "OK", version: "V27_ACTIVE_ACCOUNT_AUTO_CLAIM_AND_HISTORY", mqtt_connected: mqttClient.connected, mqtt_topic: MQTT_TOPIC, time: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ status: "OK", name: "COPD Monitor Backend V30", mqtt_topic: MQTT_TOPIC }));
+app.get("/health", (req, res) => res.json({ status: "OK", version: "V30_PATIENT_FAMILY_HOSPITAL", mqtt_connected: mqttClient.connected, mqtt_topic: MQTT_TOPIC, time: new Date().toISOString() }));
 
 app.get("/api/latest", async (req, res) => {
   const patientId = String(req.query.patient_id || "");
@@ -878,4 +924,4 @@ app.get("/api/alerts", async (req, res) => {
   return res.json(Array.isArray(data) ? data : []);
 });
 
-app.listen(PORT, () => console.log(`COPD BACKEND V22 RUNNING ON PORT ${PORT}`));
+app.listen(PORT, () => console.log(`COPD BACKEND V30 RUNNING ON PORT ${PORT}`));
